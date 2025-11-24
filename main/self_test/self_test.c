@@ -49,6 +49,13 @@
 //Test Difficulty
 #define DIFFICULTY 8
 
+// Self-test power auto-tuning (Gamma 602 only)
+#define POWER_TUNE_FREQ_STEP_MHZ 25
+#define POWER_TUNE_VOLT_STEP_MV 25
+#define POWER_TUNE_MIN_FREQ_MHZ 400
+#define POWER_TUNE_MIN_VOLT_MV 950
+#define POWER_TUNE_MAX_RETRIES 5
+
 static const char * TAG = "self_test";
 
 static SemaphoreHandle_t longPressSemaphore;
@@ -344,15 +351,11 @@ bool self_test(void * pvParameters)
         tests_done(GLOBAL_STATE, false);
     }
 
-    GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs = malloc(sizeof(bm_job *) * 128);
-    GLOBAL_STATE->valid_jobs = malloc(sizeof(uint8_t) * 128);
+    bool should_auto_tune = GLOBAL_STATE->DEVICE_CONFIG.family.id == GAMMA
+                            && strcmp(GLOBAL_STATE->DEVICE_CONFIG.board_version, "602") == 0;
 
-    for (int i = 0; i < 128; i++) {
-        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] = NULL;
-        GLOBAL_STATE->valid_jobs[i] = 0;
-    }
-
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    float current_freq = nvs_config_get_float(NVS_CONFIG_ASIC_FREQUENCY);
+    uint16_t current_mv = nvs_config_get_u16(NVS_CONFIG_ASIC_VOLTAGE);
 
     mining_notify notify_message;
     notify_message.job_id = 0;
@@ -388,77 +391,129 @@ bool self_test(void * pvParameters)
     hex2bin("cff737e1d00176dd6bbfa73071adbb370f227cfb5fba186562e4060fcec877e1", merkles[12], 32);
 
     char merkle_root[65];
-    
+
     calculate_merkle_root_hash(coinbase_tx, merkles, num_merkles, merkle_root);
 
     bm_job job = construct_bm_job(&notify_message, merkle_root, 0x1fffe000, 1000000);
 
-    ESP_LOGI(TAG, "Sending work");
+    bool power_test_passed = false;
 
-    //(*GLOBAL_STATE->ASIC_functions.send_work_fn)(GLOBAL_STATE, &job);
-    ASIC_send_work(GLOBAL_STATE, &job);
-    
-    uint32_t start_ms = esp_timer_get_time() / 1000;
-    uint32_t duration_ms = 0;
-    uint32_t counter = 0;
-    float hashrate = 0;
-    uint32_t hashtest_ms = 5000;
+    for (int attempt = 0; attempt < POWER_TUNE_MAX_RETRIES; attempt++) {
+        GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value = current_freq;
+        GLOBAL_STATE->POWER_MANAGEMENT_MODULE.expected_hashrate = current_freq
+                * GLOBAL_STATE->DEVICE_CONFIG.family.asic.small_core_count
+                * GLOBAL_STATE->DEVICE_CONFIG.family.asic_count / 1000.0f;
 
-    while (duration_ms < hashtest_ms) {
-        task_result * asic_result = ASIC_process_work(GLOBAL_STATE);
-        if (asic_result != NULL) {
-            // check the nonce difficulty
-            double nonce_diff = test_nonce_value(&job, asic_result->nonce, asic_result->rolled_version);
-            counter += DIFFICULTY;
-            duration_ms = (esp_timer_get_time() / 1000) - start_ms;
-            hashrate = hashCounterToGhs(duration_ms, counter);
+        GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs = malloc(sizeof(bm_job *) * 128);
+        GLOBAL_STATE->valid_jobs = malloc(sizeof(uint8_t) * 128);
 
-            ESP_LOGI(TAG, "Nonce %lu Nonce difficulty %.32f.", asic_result->nonce, nonce_diff);
-            ESP_LOGI(TAG, "%f Gh/s  , duration %dms", hashrate, duration_ms);
+        for (int i = 0; i < 128; i++) {
+            GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs[i] = NULL;
+            GLOBAL_STATE->valid_jobs[i] = 0;
         }
-    }
 
-    vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-    float expected_hashrate_mhs = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value 
-                                * GLOBAL_STATE->DEVICE_CONFIG.family.asic.small_core_count 
-                                * GLOBAL_STATE->DEVICE_CONFIG.family.asic.hashrate_test_percentage_target
-                                * GLOBAL_STATE->DEVICE_CONFIG.family.asic_count
-                                / 1000.0f;
+        ESP_LOGI(TAG, "Sending work (attempt %d)", attempt + 1);
+        ASIC_send_work(GLOBAL_STATE, &job);
 
-    ESP_LOGI(TAG, "Hashrate: %f, Expected: %f", hashrate, expected_hashrate_mhs);
+        uint32_t start_ms = esp_timer_get_time() / 1000;
+        uint32_t duration_ms = 0;
+        uint32_t counter = 0;
+        float hashrate = 0;
+        uint32_t hashtest_ms = 5000;
 
-    if (hashrate < expected_hashrate_mhs) {
-        display_msg("HASHRATE:FAIL", GLOBAL_STATE);
-        tests_done(GLOBAL_STATE, false);
-    }
+        while (duration_ms < hashtest_ms) {
+            task_result * asic_result = ASIC_process_work(GLOBAL_STATE);
+            if (asic_result != NULL) {
+                // check the nonce difficulty
+                double nonce_diff = test_nonce_value(&job, asic_result->nonce, asic_result->rolled_version);
+                counter += DIFFICULTY;
+                duration_ms = (esp_timer_get_time() / 1000) - start_ms;
+                hashrate = hashCounterToGhs(duration_ms, counter);
 
-    free(GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs);
-    free(GLOBAL_STATE->valid_jobs);
+                ESP_LOGI(TAG, "Nonce %lu Nonce difficulty %.32f.", asic_result->nonce, nonce_diff);
+                ESP_LOGI(TAG, "%f Gh/s  , duration %dms", hashrate, duration_ms);
+            }
+        }
 
+        vTaskDelay(10 / portTICK_PERIOD_MS);
 
-    float asic_temp = Thermal_get_chip_temp(GLOBAL_STATE);
-    ESP_LOGI(TAG, "ASIC Temp %f", asic_temp);
+        float expected_hashrate_mhs = GLOBAL_STATE->POWER_MANAGEMENT_MODULE.frequency_value
+                                    * GLOBAL_STATE->DEVICE_CONFIG.family.asic.small_core_count
+                                    * GLOBAL_STATE->DEVICE_CONFIG.family.asic.hashrate_test_percentage_target
+                                    * GLOBAL_STATE->DEVICE_CONFIG.family.asic_count
+                                    / 1000.0f;
 
-    // detect open circiut / no result
-    if(asic_temp == -1.0 || asic_temp == 127.0){
-        display_msg("TEMP:FAIL", GLOBAL_STATE);
-        tests_done(GLOBAL_STATE, false);
-    }
+        ESP_LOGI(TAG, "Hashrate: %f, Expected: %f", hashrate, expected_hashrate_mhs);
 
-    if (test_core_voltage(GLOBAL_STATE) != ESP_OK) {
-        tests_done(GLOBAL_STATE, false);
-    }
+        if (hashrate < expected_hashrate_mhs) {
+            display_msg("HASHRATE:FAIL", GLOBAL_STATE);
+            tests_done(GLOBAL_STATE, false);
+        }
 
-    // TODO: Maybe make a test equivalent for test values
-    if (test_power_consumption(GLOBAL_STATE) != ESP_OK) {
+        free(GLOBAL_STATE->ASIC_TASK_MODULE.active_jobs);
+        free(GLOBAL_STATE->valid_jobs);
+
+        float asic_temp = Thermal_get_chip_temp(GLOBAL_STATE);
+        ESP_LOGI(TAG, "ASIC Temp %f", asic_temp);
+
+        // detect open circiut / no result
+        if(asic_temp == -1.0 || asic_temp == 127.0){
+            display_msg("TEMP:FAIL", GLOBAL_STATE);
+            tests_done(GLOBAL_STATE, false);
+        }
+
+        if (test_core_voltage(GLOBAL_STATE) != ESP_OK) {
+            tests_done(GLOBAL_STATE, false);
+        }
+
+        // TODO: Maybe make a test equivalent for test values
+        if (test_power_consumption(GLOBAL_STATE) == ESP_OK) {
+            power_test_passed = true;
+            break;
+        }
+
         ESP_LOGE(TAG, "Power Draw Failed, target %.2f", (float)GLOBAL_STATE->DEVICE_CONFIG.power_consumption_target);
+
+        if (!should_auto_tune || attempt >= POWER_TUNE_MAX_RETRIES - 1) {
+            display_msg("POWER:FAIL", GLOBAL_STATE);
+            tests_done(GLOBAL_STATE, false);
+        }
+
+        float new_freq = current_freq - POWER_TUNE_FREQ_STEP_MHZ;
+        uint16_t new_mv = current_mv - POWER_TUNE_VOLT_STEP_MV;
+
+        if (new_freq < POWER_TUNE_MIN_FREQ_MHZ) new_freq = POWER_TUNE_MIN_FREQ_MHZ;
+        if (new_mv < POWER_TUNE_MIN_VOLT_MV) new_mv = POWER_TUNE_MIN_VOLT_MV;
+
+        if (new_freq == current_freq) {
+            display_msg("POWER:FAIL", GLOBAL_STATE);
+            tests_done(GLOBAL_STATE, false);
+        }
+
+        current_freq = new_freq;
+        current_mv = new_mv;
+
+        nvs_config_set_float(NVS_CONFIG_ASIC_FREQUENCY, current_freq);
+        nvs_config_set_u16(NVS_CONFIG_ASIC_VOLTAGE, current_mv);
+
+        ESP_LOGW(TAG, "Auto-tuning power test: freq=%0.2f MHz, volt=%umV", current_freq, current_mv);
+
+        VCORE_set_voltage(GLOBAL_STATE, current_mv / 1000.0f);
+        ASIC_set_frequency(GLOBAL_STATE, current_freq);
+        SERIAL_set_baud(ASIC_set_max_baud(GLOBAL_STATE));
+
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+
+    if (!power_test_passed) {
         display_msg("POWER:FAIL", GLOBAL_STATE);
         tests_done(GLOBAL_STATE, false);
     }
 
-    if (test_fan_sense(GLOBAL_STATE) != ESP_OK) {     
-        ESP_LOGE(TAG, "Fan test failed!"); 
+    if (test_fan_sense(GLOBAL_STATE) != ESP_OK) {
+        ESP_LOGE(TAG, "Fan test failed!");
         tests_done(GLOBAL_STATE, false);
     }
 
