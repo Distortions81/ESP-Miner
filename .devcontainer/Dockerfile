@@ -14,6 +14,9 @@ RUN apt-get update \
   libpixman-1-dev \
   && rm -rf /var/lib/apt/lists/*
 
+# --- FIX: allow Git to trust mounted workspace directories ---
+RUN git config --system --add safe.directory '*'
+
 # Node.js and npm (v20 is required)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
   && apt-get install -y nodejs
