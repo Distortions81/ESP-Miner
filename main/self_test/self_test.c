@@ -505,6 +505,7 @@ bool self_test(void * pvParameters)
         SERIAL_set_baud(ASIC_set_max_baud(GLOBAL_STATE));
 
         vTaskDelay(1000 / portTICK_PERIOD_MS);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 
     if (!power_test_passed) {
