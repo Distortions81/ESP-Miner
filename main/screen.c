@@ -116,12 +116,15 @@ static screen_t get_current_screen() {
 }
 
 static void alert_mode_start() {
-    if (!GLOBAL_STATE->SYSTEM_MODULE.alert_mode_active) {
+    //Don't set alert mode if the option is not enabled!
+    if (nvs_config_get_bool(NVS_CONFIG_ALERT_ENABLE)) {
         GLOBAL_STATE->SYSTEM_MODULE.alert_mode_active = true;
     }
 }
 
 static void alert_mode_end() {
+
+    //Reset this even if the setting was disabled!
     if (GLOBAL_STATE->SYSTEM_MODULE.alert_mode_active) {
         GLOBAL_STATE->SYSTEM_MODULE.alert_mode_active = false;
         alert_invert_state = false;
