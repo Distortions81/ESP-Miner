@@ -269,6 +269,9 @@ esp_err_t display_set_invert(bool invert)
         }
     }
 
+    // Trigger display activity to keep screen active and ensure updates
+    lv_display_trigger_activity(NULL);
+
     return ESP_OK;
 }
 

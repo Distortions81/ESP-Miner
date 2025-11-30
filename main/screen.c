@@ -437,8 +437,6 @@ static void screen_update_cb(lv_timer_t * timer)
         bool user_invert_setting = nvs_config_get_bool(NVS_CONFIG_INVERT_SCREEN);
         // Toggle between user's setting and inverted setting
         display_set_invert(alert_invert_state ? !user_invert_setting : user_invert_setting);
-        // Trigger display activity to keep screen active and ensure updates
-        lv_display_trigger_activity(NULL);
     }
 
     int32_t display_timeout_config = nvs_config_get_i32(NVS_CONFIG_DISPLAY_TIMEOUT);
