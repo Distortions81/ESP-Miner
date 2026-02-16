@@ -3,20 +3,6 @@
 
 #include "global_state.h"
 
-// Protocol coordinator states
-typedef enum {
-    COORD_STATE_IDLE = 0,
-    COORD_STATE_RUNNING_PRIMARY,
-    COORD_STATE_RUNNING_FALLBACK,
-} coordinator_state_t;
-
-// Events sent to the coordinator via its event queue
-typedef enum {
-    COORD_EVENT_PROTOCOL_FAILED = 0,
-    COORD_EVENT_V1_TASK_EXITED,
-    COORD_EVENT_V2_TASK_EXITED,
-} coordinator_event_t;
-
 // Initialize the coordinator (call once from main before starting the task)
 void protocol_coordinator_init(GlobalState *gs);
 

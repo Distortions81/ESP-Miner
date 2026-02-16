@@ -14,6 +14,20 @@
 
 #include <string.h>
 
+// Internal coordinator states
+typedef enum {
+    COORD_STATE_IDLE = 0,
+    COORD_STATE_RUNNING_PRIMARY,
+    COORD_STATE_RUNNING_FALLBACK,
+} coordinator_state_t;
+
+// Internal event types
+typedef enum {
+    COORD_EVENT_PROTOCOL_FAILED = 0,
+    COORD_EVENT_V1_TASK_EXITED,
+    COORD_EVENT_V2_TASK_EXITED,
+} coordinator_event_t;
+
 #define TRANSPORT_TIMEOUT_MS 5000
 #define HEARTBEAT_INTERVAL_MS 60000
 #define INITIAL_HEARTBEAT_DELAY_MS 10000
