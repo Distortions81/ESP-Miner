@@ -84,7 +84,8 @@ int sv2_encode_frame_header(uint8_t *dest, uint16_t extension_type, uint8_t msg_
 int sv2_build_setup_connection(uint8_t *buf, size_t buf_len,
                                const char *host, uint16_t port,
                                const char *vendor, const char *hw_version,
-                               const char *firmware, const char *device_id)
+                               const char *firmware, const char *device_id,
+                               uint32_t flags)
 {
     // Build payload first, then prepend header
     uint8_t payload[512];
@@ -101,8 +102,8 @@ int sv2_build_setup_connection(uint8_t *buf, size_t buf_len,
     write_u16_le(payload + pos, 2);
     pos += 2;
 
-    // flags: u32 LE = 1 (REQUIRES_STANDARD_JOBS)
-    write_u32_le(payload + pos, 0x01);
+    // flags: u32 LE
+    write_u32_le(payload + pos, flags);
     pos += 4;
 
     // endpoint_host: STR0_255
@@ -328,6 +329,212 @@ int sv2_parse_submit_shares_error(const uint8_t *payload, uint32_t len,
     int n = read_str0255(payload + 8, len - 8, error_code, error_code_size);
     if (n < 0) return -1;
     return 0;
+}
+
+// --- Extended channel message builders/parsers ---
+
+int sv2_build_open_extended_mining_channel(uint8_t *buf, size_t buf_len,
+                                           uint32_t request_id, const char *user_identity,
+                                           float nominal_hash_rate, uint16_t min_extranonce_size)
+{
+    uint8_t payload[512];
+    int pos = 0;
+
+    // request_id: u32 LE
+    write_u32_le(payload + pos, request_id);
+    pos += 4;
+
+    // user_identity: STR0_255
+    int n = write_str0255(payload + pos, sizeof(payload) - pos, user_identity);
+    if (n < 0) return -1;
+    pos += n;
+
+    // nominal_hash_rate: f32 LE
+    uint32_t f_bits;
+    memcpy(&f_bits, &nominal_hash_rate, 4);
+    write_u32_le(payload + pos, f_bits);
+    pos += 4;
+
+    // max_target: U256 (32 bytes, all 0xFF = max difficulty acceptance)
+    memset(payload + pos, 0xFF, 32);
+    pos += 32;
+
+    // min_extranonce_size: u16 LE
+    write_u16_le(payload + pos, min_extranonce_size);
+    pos += 2;
+
+    int total = SV2_FRAME_HEADER_SIZE + pos;
+    if ((size_t)total > buf_len) return -1;
+
+    sv2_encode_frame_header(buf, 0x0000, SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL, (uint32_t)pos);
+    memcpy(buf + SV2_FRAME_HEADER_SIZE, payload, pos);
+
+    return total;
+}
+
+int sv2_build_submit_shares_extended(uint8_t *buf, size_t buf_len,
+                                     uint32_t channel_id, uint32_t sequence_number,
+                                     uint32_t job_id, uint32_t nonce, uint32_t ntime,
+                                     uint32_t version, const uint8_t *extranonce,
+                                     uint8_t extranonce_len)
+{
+    // Payload: 6 * u32(24) + B0_32(1 + extranonce_len)
+    int payload_len = 24 + 1 + extranonce_len;
+    int total = SV2_FRAME_HEADER_SIZE + payload_len;
+    if ((size_t)total > buf_len) return -1;
+
+    // Channel message: extension_type has bit 15 set
+    sv2_encode_frame_header(buf, SV2_CHANNEL_MSG_FLAG, SV2_MSG_SUBMIT_SHARES_EXTENDED, (uint32_t)payload_len);
+
+    uint8_t *p = buf + SV2_FRAME_HEADER_SIZE;
+    write_u32_le(p, channel_id);      p += 4;
+    write_u32_le(p, sequence_number); p += 4;
+    write_u32_le(p, job_id);          p += 4;
+    write_u32_le(p, nonce);           p += 4;
+    write_u32_le(p, ntime);           p += 4;
+    write_u32_le(p, version);         p += 4;
+
+    // extranonce: B0_32 (1 byte length + data)
+    *p++ = extranonce_len;
+    if (extranonce_len > 0) {
+        memcpy(p, extranonce, extranonce_len);
+    }
+
+    return total;
+}
+
+int sv2_parse_open_extended_channel_success(const uint8_t *payload, uint32_t len,
+                                            uint32_t *request_id, uint32_t *channel_id,
+                                            uint8_t target[32], uint16_t *extranonce_size,
+                                            uint8_t *extranonce_prefix,
+                                            uint8_t *extranonce_prefix_len,
+                                            uint32_t *group_channel_id)
+{
+    // request_id(4) + channel_id(4) + target(32) + extranonce_size(2) + B0_32(1+N) + group_channel_id(4) = min 47 bytes
+    if (len < 47) return -1;
+
+    int pos = 0;
+    *request_id = read_u32_le(payload + pos); pos += 4;
+    *channel_id = read_u32_le(payload + pos); pos += 4;
+    memcpy(target, payload + pos, 32); pos += 32;
+
+    *extranonce_size = read_u16_le(payload + pos); pos += 2;
+
+    // extranonce_prefix: B0_32 (1 byte length + data)
+    uint8_t prefix_len = payload[pos++];
+    if (prefix_len > 32) return -1;
+    if ((uint32_t)pos + prefix_len + 4 > len) return -1;
+    *extranonce_prefix_len = prefix_len;
+    if (prefix_len > 0) {
+        memcpy(extranonce_prefix, payload + pos, prefix_len);
+    }
+    pos += prefix_len;
+
+    *group_channel_id = read_u32_le(payload + pos);
+    return 0;
+}
+
+sv2_ext_job_t *sv2_parse_new_extended_mining_job(const uint8_t *payload, uint32_t len,
+                                                  uint32_t *channel_id_out)
+{
+    // Minimum: channel_id(4) + job_id(4) + min_ntime option(1) + version(4) +
+    //          version_rolling_allowed(1) + merkle_path(1) + coinbase_prefix(2) + coinbase_suffix(2) = 19
+    if (len < 19) return NULL;
+
+    int pos = 0;
+
+    uint32_t channel_id = read_u32_le(payload + pos); pos += 4;
+    if (channel_id_out) *channel_id_out = channel_id;
+
+    uint32_t job_id = read_u32_le(payload + pos); pos += 4;
+
+    // min_ntime: Sv2Option<u32> - 1 byte flag + optional 4 byte value
+    bool has_min_ntime = false;
+    uint32_t min_ntime = 0;
+    uint8_t option_flag = payload[pos++];
+    if (option_flag == 0x01) {
+        if ((uint32_t)pos + 4 > len) return NULL;
+        has_min_ntime = true;
+        min_ntime = read_u32_le(payload + pos); pos += 4;
+    }
+
+    if ((uint32_t)pos + 4 + 1 > len) return NULL;
+    uint32_t version = read_u32_le(payload + pos); pos += 4;
+
+    bool version_rolling_allowed = (payload[pos++] != 0);
+
+    // merkle_path: SEQ0_255[U256] = 1 byte count + count * 32 bytes
+    if ((uint32_t)pos + 1 > len) return NULL;
+    uint8_t merkle_count = payload[pos++];
+    if (merkle_count > SV2_MAX_MERKLE_BRANCHES) return NULL;
+    if ((uint32_t)pos + (uint32_t)merkle_count * 32 > len) return NULL;
+
+    uint8_t merkle_path[SV2_MAX_MERKLE_BRANCHES][32];
+    for (int i = 0; i < merkle_count; i++) {
+        memcpy(merkle_path[i], payload + pos, 32);
+        pos += 32;
+    }
+
+    // coinbase_tx_prefix: B0_64K = 2 byte LE length + data
+    if ((uint32_t)pos + 2 > len) return NULL;
+    uint16_t prefix_len = read_u16_le(payload + pos); pos += 2;
+    if ((uint32_t)pos + prefix_len > len) return NULL;
+    const uint8_t *prefix_data = payload + pos;
+    pos += prefix_len;
+
+    // coinbase_tx_suffix: B0_64K = 2 byte LE length + data
+    if ((uint32_t)pos + 2 > len) return NULL;
+    uint16_t suffix_len = read_u16_le(payload + pos); pos += 2;
+    if ((uint32_t)pos + suffix_len > len) return NULL;
+    const uint8_t *suffix_data = payload + pos;
+
+    // Allocate and populate the job
+    sv2_ext_job_t *job = calloc(1, sizeof(sv2_ext_job_t));
+    if (!job) return NULL;
+
+    job->job_id = job_id;
+    job->version = version;
+    job->version_rolling_allowed = version_rolling_allowed;
+    job->ntime = has_min_ntime ? min_ntime : 0;
+    job->merkle_path_count = merkle_count;
+
+    for (int i = 0; i < merkle_count; i++) {
+        memcpy(job->merkle_path[i], merkle_path[i], 32);
+    }
+
+    if (prefix_len > 0) {
+        job->coinbase_prefix = malloc(prefix_len);
+        if (!job->coinbase_prefix) {
+            free(job);
+            return NULL;
+        }
+        memcpy(job->coinbase_prefix, prefix_data, prefix_len);
+    }
+    job->coinbase_prefix_len = prefix_len;
+
+    if (suffix_len > 0) {
+        job->coinbase_suffix = malloc(suffix_len);
+        if (!job->coinbase_suffix) {
+            free(job->coinbase_prefix);
+            free(job);
+            return NULL;
+        }
+        memcpy(job->coinbase_suffix, suffix_data, suffix_len);
+    }
+    job->coinbase_suffix_len = suffix_len;
+
+    // clean_jobs is determined later when has_min_ntime == true
+    job->clean_jobs = has_min_ntime;
+
+    return job;
+}
+
+void sv2_ext_job_free(sv2_ext_job_t *job)
+{
+    if (!job) return;
+    free(job->coinbase_prefix);
+    free(job->coinbase_suffix);
+    free(job);
 }
 
 // --- Helpers ---

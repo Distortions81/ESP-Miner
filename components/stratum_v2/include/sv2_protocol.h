@@ -17,15 +17,27 @@
 #define SV2_MSG_OPEN_STANDARD_MINING_CHANNEL            0x10
 #define SV2_MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS    0x11
 #define SV2_MSG_OPEN_MINING_CHANNEL_ERROR               0x12
+#define SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL            0x13
+#define SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS    0x14
 #define SV2_MSG_NEW_MINING_JOB                          0x15
+#define SV2_MSG_NEW_EXTENDED_MINING_JOB                 0x1f
 #define SV2_MSG_SUBMIT_SHARES_STANDARD                  0x1a
+#define SV2_MSG_SUBMIT_SHARES_EXTENDED                  0x1b
 #define SV2_MSG_SUBMIT_SHARES_SUCCESS                   0x1c
 #define SV2_MSG_SUBMIT_SHARES_ERROR                     0x1d
 #define SV2_MSG_SET_NEW_PREV_HASH                       0x20
 #define SV2_MSG_SET_TARGET                              0x21
 
+#define SV2_MAX_MERKLE_BRANCHES 20
+
 // Extension type flag for channel messages
 #define SV2_CHANNEL_MSG_FLAG 0x8000
+
+// Channel type selection
+typedef enum {
+    SV2_CHANNEL_EXTENDED = 0,
+    SV2_CHANNEL_STANDARD = 1
+} sv2_channel_type_t;
 
 // Frame header (parsed)
 typedef struct {
@@ -53,6 +65,23 @@ typedef struct {
     bool valid;
 } sv2_pending_job_t;
 
+// Extended mining job (heap-allocated, owns coinbase pointers)
+typedef struct {
+    uint32_t job_id;
+    uint32_t version;
+    bool     version_rolling_allowed;
+    uint8_t  prev_hash[32];
+    uint32_t ntime;
+    uint32_t nbits;
+    bool     clean_jobs;
+    uint8_t  merkle_path[SV2_MAX_MERKLE_BRANCHES][32];
+    uint8_t  merkle_path_count;
+    uint8_t *coinbase_prefix;     // heap
+    uint16_t coinbase_prefix_len;
+    uint8_t *coinbase_suffix;     // heap
+    uint16_t coinbase_suffix_len;
+} sv2_ext_job_t;
+
 #define SV2_PENDING_JOBS_SIZE 8
 
 // SV2 connection state
@@ -62,7 +91,7 @@ typedef struct sv2_conn {
     uint8_t target[32]; // U256 LE target
     bool channel_opened;
 
-    // Pending future jobs ring buffer
+    // Pending future jobs ring buffer (standard channels)
     sv2_pending_job_t pending_jobs[SV2_PENDING_JOBS_SIZE];
 
     // Latest prev_hash state
@@ -70,6 +99,13 @@ typedef struct sv2_conn {
     uint32_t prev_hash_ntime;
     uint32_t prev_hash_nbits;
     bool has_prev_hash;
+
+    // Extended channel state (zero for standard channels)
+    sv2_channel_type_t channel_type;
+    uint8_t  extranonce_prefix[32];
+    uint8_t  extranonce_prefix_len;
+    uint8_t  extranonce_size;              // total extranonce bytes assigned by pool
+    sv2_ext_job_t *ext_pending_jobs[SV2_PENDING_JOBS_SIZE];
 } sv2_conn_t;
 
 // --- Frame encode/decode ---
@@ -85,7 +121,8 @@ int sv2_encode_frame_header(uint8_t *dest, uint16_t extension_type, uint8_t msg_
 int sv2_build_setup_connection(uint8_t *buf, size_t buf_len,
                                const char *host, uint16_t port,
                                const char *vendor, const char *hw_version,
-                               const char *firmware, const char *device_id);
+                               const char *firmware, const char *device_id,
+                               uint32_t flags);
 
 int sv2_build_open_standard_mining_channel(uint8_t *buf, size_t buf_len,
                                            uint32_t request_id,
@@ -128,6 +165,30 @@ int sv2_parse_submit_shares_success(const uint8_t *payload, uint32_t len,
 int sv2_parse_submit_shares_error(const uint8_t *payload, uint32_t len,
                                   uint32_t *channel_id, uint32_t *seq_num,
                                   char *error_code, size_t error_code_size);
+
+// --- Extended channel message builders/parsers ---
+
+int sv2_build_open_extended_mining_channel(uint8_t *buf, size_t buf_len,
+                                           uint32_t request_id, const char *user_identity,
+                                           float nominal_hash_rate, uint16_t min_extranonce_size);
+
+int sv2_build_submit_shares_extended(uint8_t *buf, size_t buf_len,
+                                     uint32_t channel_id, uint32_t sequence_number,
+                                     uint32_t job_id, uint32_t nonce, uint32_t ntime,
+                                     uint32_t version, const uint8_t *extranonce,
+                                     uint8_t extranonce_len);
+
+int sv2_parse_open_extended_channel_success(const uint8_t *payload, uint32_t len,
+                                            uint32_t *request_id, uint32_t *channel_id,
+                                            uint8_t target[32], uint16_t *extranonce_size,
+                                            uint8_t *extranonce_prefix,
+                                            uint8_t *extranonce_prefix_len,
+                                            uint32_t *group_channel_id);
+
+sv2_ext_job_t *sv2_parse_new_extended_mining_job(const uint8_t *payload, uint32_t len,
+                                                  uint32_t *channel_id_out);
+
+void sv2_ext_job_free(sv2_ext_job_t *job);
 
 // --- Helpers ---
 

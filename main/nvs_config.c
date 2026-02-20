@@ -113,6 +113,8 @@ static Settings settings[NVS_CONFIG_COUNT] = {
     [NVS_CONFIG_SV2_AUTHORITY_PUBKEY]                  = {.nvs_key_name = "sv2authpubkey",   .type = TYPE_STR,   .default_value = {.str = ""},                           .rest_name = "sv2AuthorityPubkey",                 .min = 0,  .max = 52},
     [NVS_CONFIG_FALLBACK_STRATUM_PROTOCOL]            = {.nvs_key_name = "fbstratumprot",   .type = TYPE_U16,   .default_value = {.u16 = 0},                            .rest_name = "fallbackStratumProtocol",             .min = 0,  .max = 1},
     [NVS_CONFIG_FALLBACK_SV2_AUTHORITY_PUBKEY]        = {.nvs_key_name = "fbsv2authpubk",   .type = TYPE_STR,   .default_value = {.str = ""},                            .rest_name = "fallbackSv2AuthorityPubkey",          .min = 0,  .max = 52},
+    [NVS_CONFIG_SV2_CHANNEL_TYPE]                     = {.nvs_key_name = "sv2chantype",     .type = TYPE_U16,   .default_value = {.u16 = 0},                             .rest_name = "sv2ChannelType",                      .min = 0,  .max = 1},
+    [NVS_CONFIG_FALLBACK_SV2_CHANNEL_TYPE]            = {.nvs_key_name = "fbSv2ChanType",   .type = TYPE_U16,   .default_value = {.u16 = 0},                             .rest_name = "fallbackSv2ChannelType",              .min = 0,  .max = 1},
 };
 
 Settings *nvs_config_get_settings(NvsConfigKey key)

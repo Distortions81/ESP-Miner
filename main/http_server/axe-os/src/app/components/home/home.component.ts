@@ -621,6 +621,22 @@ export class HomeComponent implements OnInit, OnDestroy {
     return this.calculateAverage(efficiencies);
   }
 
+  getProtocolLabel(info: ISystemInfo): string {
+    if (info.activeStratumProtocol !== 1) return 'SV1';
+    const channelType = info.isUsingFallbackStratum
+      ? (info.fallbackSv2ChannelType ?? 0)
+      : (info.sv2ChannelType ?? 0);
+    return channelType === 0 ? 'SV2 Extended Channel' : 'SV2 Standard Channel';
+  }
+
+  hasCoinbaseVisibility(info: ISystemInfo): boolean {
+    if (info.activeStratumProtocol !== 1) return true; // V1 always has coinbase data
+    const channelType = info.isUsingFallbackStratum
+      ? (info.fallbackSv2ChannelType ?? 0)
+      : (info.sv2ChannelType ?? 0);
+    return channelType === 0; // 0 = extended channel has coinbase template
+  }
+
   getPayoutPercentage(info: ISystemInfo) {
     if (info.coinbaseValueTotalSatoshis) {
       return (info.coinbaseValueUserSatoshis ?? 0) / info.coinbaseValueTotalSatoshis * 100;

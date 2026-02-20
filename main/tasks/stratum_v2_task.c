@@ -13,6 +13,9 @@
 #include "work_queue.h"
 #include "utils.h"
 #include "libbase58.h"
+#include "device_config.h"
+#include "coinbase_decoder.h"
+#include "esp_heap_caps.h"
 
 #include <lwip/netdb.h>
 #include <string.h>
@@ -20,7 +23,7 @@
 
 #define MAX_RETRY_ATTEMPTS 3
 #define TRANSPORT_TIMEOUT_MS 5000
-#define SV2_MAX_FRAME_SIZE 512
+#define SV2_MAX_FRAME_SIZE 2048
 
 static const char *TAG = "stratum_v2_task";
 
@@ -112,6 +115,17 @@ static void stratum_v2_clean_queue(GlobalState *GLOBAL_STATE)
     pthread_mutex_unlock(&GLOBAL_STATE->valid_jobs_lock);
 }
 
+static sv2_channel_type_t sv2_select_channel_type(GlobalState *GLOBAL_STATE, bool use_fallback)
+{
+    NvsConfigKey key = use_fallback ? NVS_CONFIG_FALLBACK_SV2_CHANNEL_TYPE
+                                    : NVS_CONFIG_SV2_CHANNEL_TYPE;
+    uint16_t cfg = nvs_config_get_u16(key);
+    if (cfg == 1 && GLOBAL_STATE->DEVICE_CONFIG.family.asic.id != BM1397) {
+        return SV2_CHANNEL_STANDARD;
+    }
+    return SV2_CHANNEL_EXTENDED;  // default, and forced for BM1397
+}
+
 void stratum_v2_close_connection(GlobalState *GLOBAL_STATE)
 {
     ESP_LOGE(TAG, "Shutting down SV2 connection and restarting...");
@@ -151,6 +165,34 @@ int stratum_v2_submit_share(GlobalState *GLOBAL_STATE, uint32_t job_id, uint32_t
     return sv2_noise_send(GLOBAL_STATE->sv2_noise_ctx, GLOBAL_STATE->transport, buf, len);
 }
 
+int stratum_v2_submit_share_extended(GlobalState *GLOBAL_STATE, uint32_t job_id,
+                                     uint32_t nonce, uint32_t ntime, uint32_t version,
+                                     const uint8_t *extranonce, uint8_t extranonce_len)
+{
+    if (!GLOBAL_STATE->transport || !GLOBAL_STATE->sv2_conn || !GLOBAL_STATE->sv2_noise_ctx) {
+        return -1;
+    }
+
+    sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
+    uint8_t buf[SV2_FRAME_HEADER_SIZE + 24 + 1 + 32];
+
+    int len = sv2_build_submit_shares_extended(buf, sizeof(buf),
+                                                conn->channel_id,
+                                                conn->sequence_number++,
+                                                job_id, nonce, ntime, version,
+                                                extranonce, extranonce_len);
+    if (len < 0) return -1;
+
+    stratum_v2_last_submit_time_us = esp_timer_get_time();
+    return sv2_noise_send(GLOBAL_STATE->sv2_noise_ctx, GLOBAL_STATE->transport, buf, len);
+}
+
+bool stratum_v2_is_extended_channel(GlobalState *GLOBAL_STATE)
+{
+    return GLOBAL_STATE->sv2_conn &&
+           GLOBAL_STATE->sv2_conn->channel_type == SV2_CHANNEL_EXTENDED;
+}
+
 // Enqueue an sv2_job_t onto the stratum queue
 static void stratum_v2_enqueue_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
                                    uint32_t job_id, uint32_t version,
@@ -185,6 +227,214 @@ static void stratum_v2_enqueue_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
     }
 
     queue_enqueue(&GLOBAL_STATE->stratum_queue, job);
+}
+
+// Enqueue an sv2_ext_job_t onto the stratum queue (extended channels)
+static void stratum_v2_enqueue_ext_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
+                                        sv2_ext_job_t *job)
+{
+    GLOBAL_STATE->SYSTEM_MODULE.work_received++;
+
+    SYSTEM_notify_new_ntime(GLOBAL_STATE, job->ntime);
+
+    if (job->clean_jobs && (GLOBAL_STATE->stratum_queue.count > 0)) {
+        stratum_v2_clean_queue(GLOBAL_STATE);
+    }
+
+    if (GLOBAL_STATE->stratum_queue.count == QUEUE_SIZE) {
+        void *old = queue_dequeue(&GLOBAL_STATE->stratum_queue);
+        sv2_ext_job_free((sv2_ext_job_t *)old);
+    }
+
+    queue_enqueue(&GLOBAL_STATE->stratum_queue, job);
+}
+
+// Decode coinbase from extended job prefix/suffix by converting to hex and reusing V1 decoder
+static void stratum_v2_decode_coinbase(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
+                                        const sv2_ext_job_t *job)
+{
+    bool use_fallback = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback;
+    bool decode_coinbase = use_fallback
+        ? GLOBAL_STATE->SYSTEM_MODULE.fallback_pool_decode_coinbase
+        : GLOBAL_STATE->SYSTEM_MODULE.pool_decode_coinbase;
+
+    // Check for BIP141 SegWit marker/flag in prefix (bytes[4]==0x00, bytes[5]!=0x00).
+    // Some SV2 pools send the coinbase in witness format; the V1 decoder expects
+    // non-witness format, so strip the 2-byte marker+flag if present.
+    const uint8_t *prefix = job->coinbase_prefix;
+    uint16_t prefix_len = job->coinbase_prefix_len;
+    uint8_t *stripped_prefix = NULL;
+
+    if (prefix_len > 5 && prefix[4] == 0x00 && prefix[5] != 0x00) {
+        ESP_LOGD(TAG, "Stripping BIP141 marker/flag from coinbase prefix");
+        prefix_len -= 2;
+        stripped_prefix = malloc(prefix_len);
+        if (!stripped_prefix) {
+            ESP_LOGE(TAG, "Failed to allocate stripped prefix");
+            return;
+        }
+        memcpy(stripped_prefix, prefix, 4);              // version
+        memcpy(stripped_prefix + 4, prefix + 6, prefix_len - 4); // skip marker+flag
+        prefix = stripped_prefix;
+    }
+
+    // Convert binary prefix/suffix/extranonce to hex strings for the V1 decoder
+    char *coinbase_1_hex = malloc(prefix_len * 2 + 1);
+    char *coinbase_2_hex = malloc(job->coinbase_suffix_len * 2 + 1);
+    char *extranonce1_hex = malloc(conn->extranonce_prefix_len * 2 + 1);
+    if (!coinbase_1_hex || !coinbase_2_hex || !extranonce1_hex) {
+        ESP_LOGE(TAG, "Failed to allocate hex buffers for coinbase decode");
+        free(coinbase_1_hex);
+        free(coinbase_2_hex);
+        free(extranonce1_hex);
+        free(stripped_prefix);
+        return;
+    }
+
+    bin2hex(prefix, prefix_len,
+            coinbase_1_hex, prefix_len * 2 + 1);
+    bin2hex(job->coinbase_suffix, job->coinbase_suffix_len,
+            coinbase_2_hex, job->coinbase_suffix_len * 2 + 1);
+    bin2hex(conn->extranonce_prefix, conn->extranonce_prefix_len,
+            extranonce1_hex, conn->extranonce_prefix_len * 2 + 1);
+    free(stripped_prefix);
+
+    // SV2 spec: extranonce_size is the miner's rollable portion (not total)
+    int extranonce2_len = conn->extranonce_size;
+
+    // Build a temporary mining_notify for the existing V1 decoder
+    mining_notify notify = {
+        .coinbase_1 = coinbase_1_hex,
+        .coinbase_2 = coinbase_2_hex,
+        .target = conn->prev_hash_nbits,
+    };
+
+    mining_notification_result_t *result = heap_caps_malloc(sizeof(mining_notification_result_t),
+                                                            MALLOC_CAP_SPIRAM);
+    if (!result) {
+        ESP_LOGE(TAG, "Failed to allocate coinbase decode result");
+        free(coinbase_1_hex);
+        free(coinbase_2_hex);
+        free(extranonce1_hex);
+        return;
+    }
+    memset(result, 0, sizeof(mining_notification_result_t));
+
+    const char *user = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.fallback_pool_user
+                                    : GLOBAL_STATE->SYSTEM_MODULE.pool_user;
+
+    esp_err_t err = coinbase_process_notification(&notify, extranonce1_hex, extranonce2_len,
+                                                   user, decode_coinbase, result);
+    free(coinbase_1_hex);
+    free(coinbase_2_hex);
+    free(extranonce1_hex);
+
+    if (err != ESP_OK) {
+        // Log first bytes of prefix for debugging format issues
+        char prefix_hex[13] = {0}; // 6 bytes = 12 hex chars + null
+        bin2hex(job->coinbase_prefix,
+                job->coinbase_prefix_len < 6 ? job->coinbase_prefix_len : 6,
+                prefix_hex, sizeof(prefix_hex));
+        ESP_LOGE(TAG, "Failed to decode extended job coinbase (err=0x%x, prefix_len=%u, "
+                 "suffix_len=%u, en_prefix_len=%u, en_size=%u, prefix_start=%s)",
+                 err, job->coinbase_prefix_len, job->coinbase_suffix_len,
+                 conn->extranonce_prefix_len, conn->extranonce_size, prefix_hex);
+        free(result);
+        return;
+    }
+
+    if (result->block_height != 0 && (uint32_t)GLOBAL_STATE->block_height != result->block_height) {
+        ESP_LOGI(TAG, "Block height %d", result->block_height);
+        GLOBAL_STATE->block_height = result->block_height;
+    }
+
+    if (result->scriptsig) {
+        if (strcmp(result->scriptsig, GLOBAL_STATE->scriptsig) != 0) {
+            ESP_LOGI(TAG, "Scriptsig: %s", result->scriptsig);
+            strncpy(GLOBAL_STATE->scriptsig, result->scriptsig, sizeof(GLOBAL_STATE->scriptsig) - 1);
+            GLOBAL_STATE->scriptsig[sizeof(GLOBAL_STATE->scriptsig) - 1] = '\0';
+        }
+        free(result->scriptsig);
+    }
+
+    if (result->output_count > MAX_COINBASE_TX_OUTPUTS) {
+        result->output_count = MAX_COINBASE_TX_OUTPUTS;
+    }
+
+    GLOBAL_STATE->coinbase_value_total_satoshis = result->total_value_satoshis;
+    ESP_LOGI(TAG, "Coinbase outputs: %d, total value: %llu%s",
+             result->output_count, result->total_value_satoshis,
+             result->decoding_enabled ? " sats" : "");
+
+    if (result->output_count != GLOBAL_STATE->coinbase_output_count ||
+        memcmp(result->outputs, GLOBAL_STATE->coinbase_outputs,
+               sizeof(coinbase_output_t) * result->output_count) != 0) {
+
+        GLOBAL_STATE->coinbase_output_count = result->output_count;
+        memcpy(GLOBAL_STATE->coinbase_outputs, result->outputs,
+               sizeof(coinbase_output_t) * result->output_count);
+        GLOBAL_STATE->coinbase_value_user_satoshis = result->user_value_satoshis;
+        for (int i = 0; i < result->output_count; i++) {
+            if (result->outputs[i].value_satoshis > 0) {
+                if (result->outputs[i].is_user_output) {
+                    ESP_LOGI(TAG, "  Output %d: %s (%llu sat) (Your payout address)",
+                             i, result->outputs[i].address, result->outputs[i].value_satoshis);
+                } else {
+                    ESP_LOGI(TAG, "  Output %d: %s (%llu sat)",
+                             i, result->outputs[i].address, result->outputs[i].value_satoshis);
+                }
+            } else {
+                ESP_LOGI(TAG, "  Output %d: %s", i, result->outputs[i].address);
+            }
+        }
+    }
+
+    free(result);
+}
+
+// Handle NewExtendedMiningJob message
+static void stratum_v2_handle_new_extended_mining_job(GlobalState *GLOBAL_STATE, sv2_conn_t *conn,
+                                                       const uint8_t *payload, uint32_t len)
+{
+    uint32_t channel_id;
+    sv2_ext_job_t *job = sv2_parse_new_extended_mining_job(payload, len, &channel_id);
+    if (!job) {
+        ESP_LOGE(TAG, "Failed to parse NewExtendedMiningJob");
+        return;
+    }
+
+    ESP_LOGI(TAG, "New extended mining job: id=%lu, version=%08lx, merkle_branches=%d, "
+             "coinbase_prefix=%u, coinbase_suffix=%u, future=%s",
+             job->job_id, job->version, job->merkle_path_count,
+             job->coinbase_prefix_len, job->coinbase_suffix_len,
+             job->ntime > 0 ? "no" : "yes");
+
+    // Decode coinbase transaction (block height, scriptsig, outputs)
+    stratum_v2_decode_coinbase(GLOBAL_STATE, conn, job);
+
+    int slot = job->job_id % SV2_PENDING_JOBS_SIZE;
+
+    if (job->ntime > 0) {
+        // Has min_ntime — this is a current job
+        if (conn->has_prev_hash) {
+            memcpy(job->prev_hash, conn->prev_hash, 32);
+            job->nbits = conn->prev_hash_nbits;
+            job->clean_jobs = true;
+            stratum_v2_enqueue_ext_job(GLOBAL_STATE, conn, job);
+        } else {
+            // Store as pending until we get SetNewPrevHash
+            if (conn->ext_pending_jobs[slot]) {
+                sv2_ext_job_free(conn->ext_pending_jobs[slot]);
+            }
+            conn->ext_pending_jobs[slot] = job;
+        }
+    } else {
+        // Future job — store in pending ring
+        if (conn->ext_pending_jobs[slot]) {
+            sv2_ext_job_free(conn->ext_pending_jobs[slot]);
+        }
+        conn->ext_pending_jobs[slot] = job;
+    }
 }
 
 // Handle NewMiningJob message
@@ -252,6 +502,8 @@ static void stratum_v2_handle_set_new_prev_hash(GlobalState *GLOBAL_STATE, sv2_c
     conn->has_prev_hash = true;
 
     int slot = job_id % SV2_PENDING_JOBS_SIZE;
+
+    // Resolve standard channel pending jobs
     if (conn->pending_jobs[slot].valid && conn->pending_jobs[slot].job_id == job_id) {
         stratum_v2_enqueue_job(GLOBAL_STATE, conn, job_id,
                                conn->pending_jobs[slot].version,
@@ -270,6 +522,33 @@ static void stratum_v2_handle_set_new_prev_hash(GlobalState *GLOBAL_STATE, sv2_c
                                        conn->pending_jobs[i].merkle_root,
                                        prev_hash, min_ntime, nbits, true);
                 conn->pending_jobs[i].valid = false;
+            }
+        }
+    }
+
+    // Resolve extended channel pending jobs
+    if (conn->ext_pending_jobs[slot] && conn->ext_pending_jobs[slot]->job_id == job_id) {
+        sv2_ext_job_t *ext_job = conn->ext_pending_jobs[slot];
+        conn->ext_pending_jobs[slot] = NULL;
+        memcpy(ext_job->prev_hash, prev_hash, 32);
+        ext_job->ntime = min_ntime;
+        ext_job->nbits = nbits;
+        ext_job->clean_jobs = true;
+        stratum_v2_enqueue_ext_job(GLOBAL_STATE, conn, ext_job);
+    }
+
+    if (first_prev_hash) {
+        for (int i = 0; i < SV2_PENDING_JOBS_SIZE; i++) {
+            if (conn->ext_pending_jobs[i] && conn->ext_pending_jobs[i]->job_id != job_id) {
+                sv2_ext_job_t *ext_job = conn->ext_pending_jobs[i];
+                conn->ext_pending_jobs[i] = NULL;
+                ESP_LOGD(TAG, "Enqueuing pending ext future job %lu with first prev_hash",
+                         ext_job->job_id);
+                memcpy(ext_job->prev_hash, prev_hash, 32);
+                ext_job->ntime = min_ntime;
+                ext_job->nbits = nbits;
+                ext_job->clean_jobs = true;
+                stratum_v2_enqueue_ext_job(GLOBAL_STATE, conn, ext_job);
             }
         }
     }
@@ -298,8 +577,16 @@ void stratum_v2_task(void *pvParameters)
 {
     GlobalState *GLOBAL_STATE = (GlobalState *)pvParameters;
 
-    // Set V2-specific free function for the work queue (sv2_job_t is flat, just free())
-    GLOBAL_STATE->stratum_queue.free_fn = free;
+    // Determine channel type before setting up queue free function
+    bool use_fallback_init = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback;
+    sv2_channel_type_t channel_type = sv2_select_channel_type(GLOBAL_STATE, use_fallback_init);
+
+    // Set V2-specific free function for the work queue
+    if (channel_type == SV2_CHANNEL_EXTENDED) {
+        GLOBAL_STATE->stratum_queue.free_fn = (void (*)(void *))sv2_ext_job_free;
+    } else {
+        GLOBAL_STATE->stratum_queue.free_fn = free;
+    }
 
     // Set default version mask for version rolling
     GLOBAL_STATE->version_mask = STRATUM_DEFAULT_VERSION_MASK;
@@ -432,14 +719,20 @@ void stratum_v2_task(void *pvParameters)
         sv2_frame_header_t hdr;
         int payload_len;
 
+        // Select channel type and set connection state
+        conn->channel_type = channel_type;
+        uint32_t setup_flags = (channel_type == SV2_CHANNEL_STANDARD) ? 0x01 : 0x00;
+
         // 1. Send SetupConnection
         {
             const char *device_model = GLOBAL_STATE->DEVICE_CONFIG.family.asic.name;
-            ESP_LOGI(TAG, "Sending SetupConnection (vendor=bitaxe, hw=%s)", device_model ? device_model : "");
+            ESP_LOGI(TAG, "Sending SetupConnection (vendor=bitaxe, hw=%s, channel=%s)",
+                     device_model ? device_model : "",
+                     channel_type == SV2_CHANNEL_EXTENDED ? "extended" : "standard");
             int frame_len = sv2_build_setup_connection(frame_buf, sizeof(frame_buf),
                                                        stratum_url, port,
                                                        "bitaxe", device_model ? device_model : "",
-                                                       "", "");
+                                                       "", "", setup_flags);
             if (frame_len < 0 || sv2_noise_send(noise_ctx, transport, frame_buf, frame_len) != 0) {
                 ESP_LOGE(TAG, "Failed to send SetupConnection");
                 stratum_v2_close_connection(GLOBAL_STATE);
@@ -477,23 +770,32 @@ void stratum_v2_task(void *pvParameters)
             ESP_LOGI(TAG, "Pool accepted connection: SV2 version=%d, flags=0x%08lx", used_version, flags);
         }
 
-        // 3. Send OpenStandardMiningChannel
+        // 3. Send OpenMiningChannel (extended or standard)
         {
             char *user = use_fallback ? GLOBAL_STATE->SYSTEM_MODULE.fallback_pool_user
                                       : GLOBAL_STATE->SYSTEM_MODULE.pool_user;
             float hash_rate = 1e12;
-            ESP_LOGI(TAG, "Opening mining channel (user=%s)", user ? user : "(empty)");
-            int frame_len = sv2_build_open_standard_mining_channel(frame_buf, sizeof(frame_buf),
+            int frame_len;
+
+            if (channel_type == SV2_CHANNEL_EXTENDED) {
+                ESP_LOGI(TAG, "Opening extended mining channel (user=%s)", user ? user : "(empty)");
+                frame_len = sv2_build_open_extended_mining_channel(frame_buf, sizeof(frame_buf),
+                                                                    1, user ? user : "", hash_rate, 6);
+            } else {
+                ESP_LOGI(TAG, "Opening standard mining channel (user=%s)", user ? user : "(empty)");
+                frame_len = sv2_build_open_standard_mining_channel(frame_buf, sizeof(frame_buf),
                                                                     1, user ? user : "", hash_rate);
+            }
+
             if (frame_len < 0 || sv2_noise_send(noise_ctx, transport, frame_buf, frame_len) != 0) {
-                ESP_LOGE(TAG, "Failed to send OpenStandardMiningChannel");
+                ESP_LOGE(TAG, "Failed to send OpenMiningChannel");
                 stratum_v2_close_connection(GLOBAL_STATE);
                 retry_attempts++;
                 continue;
             }
         }
 
-        // 4. Receive OpenStandardMiningChannelSuccess
+        // 4. Receive OpenMiningChannelSuccess
         {
             if (sv2_noise_recv(noise_ctx, transport, hdr_buf, recv_buf,
                                sizeof(recv_buf), &payload_len) != 0) {
@@ -504,8 +806,13 @@ void stratum_v2_task(void *pvParameters)
             }
             sv2_parse_frame_header(hdr_buf, &hdr);
 
-            if (hdr.msg_type != SV2_MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS) {
-                ESP_LOGE(TAG, "OpenChannel rejected by pool (msg_type=0x%02x)", hdr.msg_type);
+            uint8_t expected_msg = (channel_type == SV2_CHANNEL_EXTENDED)
+                                   ? SV2_MSG_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS
+                                   : SV2_MSG_OPEN_STANDARD_MINING_CHANNEL_SUCCESS;
+
+            if (hdr.msg_type != expected_msg) {
+                ESP_LOGE(TAG, "OpenChannel rejected by pool (msg_type=0x%02x, expected=0x%02x)",
+                         hdr.msg_type, expected_msg);
                 stratum_v2_close_connection(GLOBAL_STATE);
                 retry_attempts++;
                 continue;
@@ -513,17 +820,42 @@ void stratum_v2_task(void *pvParameters)
 
             uint32_t request_id, channel_id, group_channel_id;
             uint8_t target[32];
-            uint8_t extranonce_prefix[32];
-            uint8_t extranonce_prefix_len;
 
-            if (sv2_parse_open_channel_success(recv_buf, payload_len,
-                                                &request_id, &channel_id, target,
-                                                extranonce_prefix, &extranonce_prefix_len,
-                                                &group_channel_id) != 0) {
-                ESP_LOGE(TAG, "Failed to parse OpenChannelSuccess");
-                stratum_v2_close_connection(GLOBAL_STATE);
-                retry_attempts++;
-                continue;
+            if (channel_type == SV2_CHANNEL_EXTENDED) {
+                uint16_t extranonce_size;
+                uint8_t extranonce_prefix[32];
+                uint8_t extranonce_prefix_len;
+
+                if (sv2_parse_open_extended_channel_success(recv_buf, payload_len,
+                                                            &request_id, &channel_id, target,
+                                                            &extranonce_size,
+                                                            extranonce_prefix, &extranonce_prefix_len,
+                                                            &group_channel_id) != 0) {
+                    ESP_LOGE(TAG, "Failed to parse OpenExtendedChannelSuccess");
+                    stratum_v2_close_connection(GLOBAL_STATE);
+                    retry_attempts++;
+                    continue;
+                }
+
+                conn->extranonce_size = (uint8_t)extranonce_size;
+                conn->extranonce_prefix_len = extranonce_prefix_len;
+                memcpy(conn->extranonce_prefix, extranonce_prefix, extranonce_prefix_len);
+
+                ESP_LOGI(TAG, "Extended channel: extranonce_size=%d, prefix_len=%d",
+                         extranonce_size, extranonce_prefix_len);
+            } else {
+                uint8_t extranonce_prefix[32];
+                uint8_t extranonce_prefix_len;
+
+                if (sv2_parse_open_channel_success(recv_buf, payload_len,
+                                                    &request_id, &channel_id, target,
+                                                    extranonce_prefix, &extranonce_prefix_len,
+                                                    &group_channel_id) != 0) {
+                    ESP_LOGE(TAG, "Failed to parse OpenChannelSuccess");
+                    stratum_v2_close_connection(GLOBAL_STATE);
+                    retry_attempts++;
+                    continue;
+                }
             }
 
             conn->channel_id = channel_id;
@@ -534,7 +866,9 @@ void stratum_v2_task(void *pvParameters)
             GLOBAL_STATE->pool_difficulty = pdiff;
             GLOBAL_STATE->new_set_mining_difficulty_msg = true;
 
-            ESP_LOGI(TAG, "Mining channel opened: channel_id=%lu, group=%lu", channel_id, group_channel_id);
+            ESP_LOGI(TAG, "Mining channel opened: channel_id=%lu, group=%lu, type=%s",
+                     channel_id, group_channel_id,
+                     channel_type == SV2_CHANNEL_EXTENDED ? "extended" : "standard");
             ESP_LOGI(TAG, "Set pool difficulty: %lu", pdiff);
         }
 
@@ -562,6 +896,10 @@ void stratum_v2_task(void *pvParameters)
             switch (hdr.msg_type) {
                 case SV2_MSG_NEW_MINING_JOB:
                     stratum_v2_handle_new_mining_job(GLOBAL_STATE, conn, recv_buf, hdr.msg_length);
+                    break;
+
+                case SV2_MSG_NEW_EXTENDED_MINING_JOB:
+                    stratum_v2_handle_new_extended_mining_job(GLOBAL_STATE, conn, recv_buf, hdr.msg_length);
                     break;
 
                 case SV2_MSG_SET_NEW_PREV_HASH:

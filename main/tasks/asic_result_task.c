@@ -8,6 +8,7 @@
 #include "nvs_config.h"
 #include "utils.h"
 #include "stratum_v2_task.h"
+#include "sv2_protocol.h"
 #include "hashrate_monitor_task.h"
 #include "asic.h"
 
@@ -59,10 +60,25 @@ void ASIC_result_task(void *pvParameters)
             if (GLOBAL_STATE->stratum_protocol == STRATUM_V2) {
                 // SV2: submit with binary protocol
                 uint32_t sv2_job_id = (uint32_t)strtoul(active_job->jobid, NULL, 10);
-                ret = stratum_v2_submit_share(GLOBAL_STATE, sv2_job_id,
-                                       asic_result->nonce,
-                                       active_job->ntime,
-                                       asic_result->rolled_version);
+
+                if (stratum_v2_is_extended_channel(GLOBAL_STATE)) {
+                    sv2_conn_t *conn = GLOBAL_STATE->sv2_conn;
+                    // SV2 spec: extranonce_size is the miner's rollable portion.
+                    // The pool prepends its extranonce_prefix separately.
+                    uint8_t en2_len = conn->extranonce_size;
+                    uint8_t extranonce_2[32];
+                    hex2bin(active_job->extranonce2, extranonce_2, en2_len);
+                    ret = stratum_v2_submit_share_extended(GLOBAL_STATE, sv2_job_id,
+                                                           asic_result->nonce,
+                                                           active_job->ntime,
+                                                           asic_result->rolled_version,
+                                                           extranonce_2, en2_len);
+                } else {
+                    ret = stratum_v2_submit_share(GLOBAL_STATE, sv2_job_id,
+                                                   asic_result->nonce,
+                                                   active_job->ntime,
+                                                   asic_result->rolled_version);
+                }
             } else {
                 // V1: submit with JSON-RPC
                 char * user = GLOBAL_STATE->SYSTEM_MODULE.is_using_fallback ? GLOBAL_STATE->SYSTEM_MODULE.fallback_pool_user : GLOBAL_STATE->SYSTEM_MODULE.pool_user;

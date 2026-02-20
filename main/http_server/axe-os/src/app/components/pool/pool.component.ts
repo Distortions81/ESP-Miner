@@ -17,6 +17,11 @@ interface IProtocolOption {
   label: string;
 }
 
+interface IChannelOption {
+  value: number;
+  label: string;
+}
+
 @Component({
   selector: 'app-pool',
   templateUrl: './pool.component.html',
@@ -43,6 +48,13 @@ export class PoolComponent implements OnInit {
     { value: 1, label: 'Stratum V2' }
   ];
 
+  public sv2ChannelOptions: IChannelOption[] = [
+    { value: 0, label: 'Extended Channels' },
+    { value: 1, label: 'Standard Channels' }
+  ];
+
+  public asicModel: string = '';
+
   @Input() uri = '';
 
   constructor(
@@ -58,6 +70,7 @@ export class PoolComponent implements OnInit {
         this.loadingService.lockUIUntilComplete()
       )
       .subscribe(info => {
+        this.asicModel = info.ASICModel || '';
         this.form = this.fb.group({
           stratumURL: [info.stratumURL, [
             Validators.required,
@@ -95,7 +108,9 @@ export class PoolComponent implements OnInit {
           fallbackStratumUser: [info.fallbackStratumUser, [Validators.required]],
           fallbackStratumPassword: ['*****', [Validators.required]],
           fallbackStratumProtocol: [info.fallbackStratumProtocol || 0],
-          fallbackSv2AuthorityPubkey: [info.fallbackSv2AuthorityPubkey || '', [this.base58Validator()]]
+          fallbackSv2AuthorityPubkey: [info.fallbackSv2AuthorityPubkey || '', [this.base58Validator()]],
+          sv2ChannelType: [info.sv2ChannelType ?? 0],
+          fallbackSv2ChannelType: [info.fallbackSv2ChannelType ?? 0]
         });
 
         const setupTlsValidation = (tlsControlName: string, certControlName: string) => {
@@ -289,5 +304,15 @@ export class PoolComponent implements OnInit {
 
   isPoolV2Enabled(pool: PoolType): boolean {
     return pool === 'stratum' ? this.isStratumV2Enabled() : this.isFallbackStratumV2Enabled();
+  }
+
+  isStandardChannelDisabled(): boolean {
+    return this.asicModel === 'BM1397';
+  }
+
+  isPoolV2Extended(pool: PoolType): boolean {
+    if (!this.isPoolV2Enabled(pool)) return false;
+    const key = pool === 'stratum' ? 'sv2ChannelType' : 'fallbackSv2ChannelType';
+    return this.form?.get(key)?.value === 0;
   }
 }

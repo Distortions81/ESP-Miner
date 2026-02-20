@@ -260,6 +260,9 @@ components:
         fallbackSv2AuthorityPubkey:
           type: string
           description: Fallback SV2 authority public key for certificate verification (base58-encoded)
+        fallbackSv2ChannelType:
+          type: number
+          description: Fallback SV2 channel type (0=extended, 1=standard)
         fanrpm:
           type: number
           description: Current fan speed in RPM
@@ -400,6 +403,9 @@ components:
         sv2AuthorityPubkey:
           type: string
           description: SV2 authority public key for certificate verification (base58-encoded)
+        sv2ChannelType:
+          type: number
+          description: SV2 channel type (0=extended, 1=standard)
         stratumSuggestedDifficulty:
           type: number
           description: Pool suggested difficulty
