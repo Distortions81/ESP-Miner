@@ -34,7 +34,7 @@ export class QuicklinkService {
       { search: 'parasite.wtf', url: `https://parasite.space/user/${user}` },
       { regex: /^(eu|au)?solo[46]?.ckpool\.org/, url: `https://$1solostats.ckpool.org/users/${user}` },
       { search: 'atlaspool.io', url: `https://atlaspool.io/dashboard.html?wallet=${user}` },
-      { regex: /^((?:[a-z0-9-]+\.)*)m45core\.com$/, url: `https://$1m45core.com/user/${user}` },
+      { regex: /^(eu\.|tinyminer\.)?m45core\.com$/, url: `https://$1m45core.com/user/${user}` },
     ];
 
     const normalizedStratumURL = stratumURL.toLowerCase();
